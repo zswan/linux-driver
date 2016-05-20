@@ -1,0 +1,197 @@
+Add eMMC rpmb driver access interface in Kernel side.
+This patch is to match AMD PSP team requirement that
+access rpmb partition from kernel side not user ioctl
+so we add this 'rpmb_access'.
+
+Signed-off-by: Vincent.Wan <Vincent.Wan@amd.com>
+
+---
+ drivers/mmc/card/block.c       | 159 +++++++++++++++++++++++++++++++++++++++++
+ include/uapi/linux/mmc/ioctl.h |   1 +
+ 2 files changed, 160 insertions(+)
+
+diff --git a/drivers/mmc/card/block.c b/drivers/mmc/card/block.c
+index 8fbbc31..6315cad 100644
+--- a/drivers/mmc/card/block.c
++++ b/drivers/mmc/card/block.c
+@@ -439,6 +439,165 @@ out:
+ 	return err;
+ }
+ 
++int rpmb_access(struct block_device *bdev, struct mmc_blk_ioc_data *idata)
++{
++	struct mmc_blk_data *md;
++	struct mmc_blk_data *data_md;
++	struct mmc_card *card;
++	struct mmc_command cmd = {0};
++	struct mmc_data data = {0};
++	struct mmc_request mrq = {NULL};
++	struct scatterlist sg;
++	struct block_device *data_bdev;
++	struct mmc_queue *mq;
++
++	int err;
++	int is_rpmb = false;
++	u32 status = 0;
++
++	/*
++	* Try to get mmc_queue pointer, since RPMB partition access process need
++	* do sync with DATA partition access process, it need get thread_sem of
++	* data access process.
++	*/
++	data_bdev = blkdev_get_by_dev(MKDEV(MMC_BLOCK_MAJOR, 0),
++					FMODE_READ | FMODE_WRITE, NULL);
++	if (IS_ERR(data_bdev)) {
++		pr_err("Could not open eMMC DATA block_device!\n");
++		return PTR_ERR(data_bdev);
++	}
++
++	data_md = mmc_blk_get(data_bdev->bd_disk);
++	if (!data_md) {
++		err = -EINVAL;
++		return err;
++	}
++	mq = &data_md->queue;
++
++	down(&mq->thread_sem);
++
++	md = mmc_blk_get(bdev->bd_disk);
++	if (!md) {
++		err = -EINVAL;
++		goto cmd_err;
++	}
++
++	if (md->area_type & MMC_BLK_DATA_AREA_RPMB)
++		is_rpmb = true;
++
++	card = md->queue.card;
++	if (IS_ERR(card)) {
++		err = PTR_ERR(card);
++		goto cmd_done;
++	}
++
++	cmd.opcode = idata->ic.opcode;
++	cmd.arg = idata->ic.arg;
++	cmd.flags = idata->ic.flags;
++
++	if (idata->buf_bytes) {
++		data.sg = &sg;
++		data.sg_len = 1;
++		data.blksz = idata->ic.blksz;
++		data.blocks = idata->ic.blocks;
++
++		sg_init_one(data.sg, idata->buf, idata->buf_bytes);
++
++		if (idata->ic.write_flag)
++			data.flags = MMC_DATA_WRITE;
++		else
++			data.flags = MMC_DATA_READ;
++
++		/* data.flags must already be set before doing this. */
++		mmc_set_data_timeout(&data, card);
++
++		/* Allow overriding the timeout_ns for empirical tuning. */
++		if (idata->ic.data_timeout_ns)
++			data.timeout_ns = idata->ic.data_timeout_ns;
++
++		if ((cmd.flags & MMC_RSP_R1B) == MMC_RSP_R1B) {
++			/*
++			 * Pretend this is a data transfer and rely on the
++			 * host driver to compute timeout.  When all host
++			 * drivers support cmd.cmd_timeout for R1B, this
++			 * can be changed to:
++			 *
++			 *     mrq.data = NULL;
++			 *     cmd.cmd_timeout = idata->ic.cmd_timeout_ms;
++			 */
++			data.timeout_ns = idata->ic.cmd_timeout_ms * 1000000;
++		}
++
++		mrq.data = &data;
++	}
++
++	mrq.cmd = &cmd;
++
++	mmc_claim_host(card->host);
++
++	err = mmc_blk_part_switch(card, md);
++	if (err)
++		goto cmd_rel_host;
++
++	if (idata->ic.is_acmd) {
++		err = mmc_app_cmd(card->host, card);
++		if (err)
++			goto cmd_rel_host;
++	}
++
++	if (is_rpmb) {
++		err = mmc_set_blockcount(card, data.blocks,
++			idata->ic.reliable_write_flag);
++		if (err)
++			goto cmd_rel_host;
++	}
++
++	mmc_wait_for_req(card->host, &mrq);
++
++	if (cmd.error) {
++		dev_err(mmc_dev(card->host), "%s: cmd error %d\n",
++						__func__, cmd.error);
++		err = cmd.error;
++		goto cmd_rel_host;
++	}
++	if (data.error) {
++		dev_err(mmc_dev(card->host), "%s: data error %d\n",
++						__func__, data.error);
++		err = data.error;
++		goto cmd_rel_host;
++	}
++
++	/*
++	 * According to the SD specs, some commands require a delay after
++	 * issuing the command.
++	 */
++	if (idata->ic.postsleep_min_us)
++		usleep_range(idata->ic.postsleep_min_us,
++				idata->ic.postsleep_max_us);
++
++	if (is_rpmb) {
++		/*
++		 * Ensure RPMB command has completed by polling CMD13
++		 * "Send Status".
++		 */
++		err = ioctl_rpmb_card_status_poll(card, &status, 5);
++		if (err)
++			pr_err("%s: Card Status=0x%08X, error %d\n",
++					__func__, status, err);
++	}
++
++cmd_rel_host:
++	mmc_release_host(card->host);
++
++cmd_done:
++	mmc_blk_put(md);
++cmd_err:
++	up(&mq->thread_sem);
++	mmc_blk_put(data_md);
++	return err;
++}
++EXPORT_SYMBOL(rpmb_access);
++
+ static int mmc_blk_ioctl_cmd(struct block_device *bdev,
+ 	struct mmc_ioc_cmd __user *ic_ptr)
+ {
+diff --git a/include/uapi/linux/mmc/ioctl.h b/include/uapi/linux/mmc/ioctl.h
+index 1f5e689..5d07cbb 100644
+--- a/include/uapi/linux/mmc/ioctl.h
++++ b/include/uapi/linux/mmc/ioctl.h
+@@ -6,6 +6,7 @@
+ struct mmc_ioc_cmd {
+ 	/* Implies direction of data.  true = write, false = read */
+ 	int write_flag;
++	int reliable_write_flag;
+ 
+ 	/* Application-specific command.  true = precede with CMD55 */
+ 	int is_acmd;
+-- 
+1.8.1.2
+

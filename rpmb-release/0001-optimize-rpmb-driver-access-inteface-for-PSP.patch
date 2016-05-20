@@ -1,0 +1,191 @@
+From 01effc964a6ec2ba960704c04da1aec0cc6bb520 Mon Sep 17 00:00:00 2001
+From: "Vincent.Wan" <Vincent.Wan@amd.com>
+Date: Tue, 1 Jul 2014 17:47:23 +0800
+Subject: [PATCH] optimize rpmb driver access inteface for PSP
+
+---
+ drivers/mmc/card/block.c | 133 +++++++++++++++--------------------------------
+ 1 file changed, 43 insertions(+), 90 deletions(-)
+
+diff --git a/drivers/mmc/card/block.c b/drivers/mmc/card/block.c
+index 6315cad..547d51c 100644
+--- a/drivers/mmc/card/block.c
++++ b/drivers/mmc/card/block.c
+@@ -439,58 +439,48 @@ out:
+ 	return err;
+ }
+ 
+-int rpmb_access(struct block_device *bdev, struct mmc_blk_ioc_data *idata)
++static struct mmc_blk_data *rpmb_md;
++static struct mmc_card *rpmb_card;
++int mmc_blk_card_get(struct block_device *bdev) {
++
++	rpmb_md = mmc_blk_get(bdev->bd_disk);
++	if (!rpmb_md)
++		return -EINVAL;
++
++	rpmb_card = rpmb_md->queue.card;
++	if (IS_ERR(rpmb_card)) {
++		mmc_blk_put(rpmb_md);
++		return PTR_ERR(rpmb_card);
++	}
++
++	mmc_get_card(rpmb_card);
++	return 0;
++}
++EXPORT_SYMBOL(mmc_blk_card_get);
++
++int mmc_card_blk_put(struct block_device *bdev) {
++
++	mmc_put_card(rpmb_card);
++	rpmb_card = NULL;
++
++	mmc_blk_put(rpmb_md);
++	rpmb_md = NULL;
++	return 0;
++}
++EXPORT_SYMBOL(mmc_card_blk_put);
++
++int rpmb_access(struct mmc_blk_ioc_data *idata)
+ {
+-	struct mmc_blk_data *md;
+-	struct mmc_blk_data *data_md;
+-	struct mmc_card *card;
+ 	struct mmc_command cmd = {0};
+ 	struct mmc_data data = {0};
+ 	struct mmc_request mrq = {NULL};
+ 	struct scatterlist sg;
+-	struct block_device *data_bdev;
+-	struct mmc_queue *mq;
++	struct mmc_blk_data *md = rpmb_md;
++	struct mmc_card *card = rpmb_card;
+ 
+ 	int err;
+-	int is_rpmb = false;
+ 	u32 status = 0;
+ 
+-	/*
+-	* Try to get mmc_queue pointer, since RPMB partition access process need
+-	* do sync with DATA partition access process, it need get thread_sem of
+-	* data access process.
+-	*/
+-	data_bdev = blkdev_get_by_dev(MKDEV(MMC_BLOCK_MAJOR, 0),
+-					FMODE_READ | FMODE_WRITE, NULL);
+-	if (IS_ERR(data_bdev)) {
+-		pr_err("Could not open eMMC DATA block_device!\n");
+-		return PTR_ERR(data_bdev);
+-	}
+-
+-	data_md = mmc_blk_get(data_bdev->bd_disk);
+-	if (!data_md) {
+-		err = -EINVAL;
+-		return err;
+-	}
+-	mq = &data_md->queue;
+-
+-	down(&mq->thread_sem);
+-
+-	md = mmc_blk_get(bdev->bd_disk);
+-	if (!md) {
+-		err = -EINVAL;
+-		goto cmd_err;
+-	}
+-
+-	if (md->area_type & MMC_BLK_DATA_AREA_RPMB)
+-		is_rpmb = true;
+-
+-	card = md->queue.card;
+-	if (IS_ERR(card)) {
+-		err = PTR_ERR(card);
+-		goto cmd_done;
+-	}
+-
+ 	cmd.opcode = idata->ic.opcode;
+ 	cmd.arg = idata->ic.arg;
+ 	cmd.flags = idata->ic.flags;
+@@ -511,46 +501,19 @@ int rpmb_access(struct block_device *bdev, struct mmc_blk_ioc_data *idata)
+ 		/* data.flags must already be set before doing this. */
+ 		mmc_set_data_timeout(&data, card);
+ 
+-		/* Allow overriding the timeout_ns for empirical tuning. */
+-		if (idata->ic.data_timeout_ns)
+-			data.timeout_ns = idata->ic.data_timeout_ns;
+-
+-		if ((cmd.flags & MMC_RSP_R1B) == MMC_RSP_R1B) {
+-			/*
+-			 * Pretend this is a data transfer and rely on the
+-			 * host driver to compute timeout.  When all host
+-			 * drivers support cmd.cmd_timeout for R1B, this
+-			 * can be changed to:
+-			 *
+-			 *     mrq.data = NULL;
+-			 *     cmd.cmd_timeout = idata->ic.cmd_timeout_ms;
+-			 */
+-			data.timeout_ns = idata->ic.cmd_timeout_ms * 1000000;
+-		}
+-
+ 		mrq.data = &data;
+ 	}
+ 
+ 	mrq.cmd = &cmd;
+ 
+-	mmc_claim_host(card->host);
+-
+ 	err = mmc_blk_part_switch(card, md);
+ 	if (err)
+ 		goto cmd_rel_host;
+ 
+-	if (idata->ic.is_acmd) {
+-		err = mmc_app_cmd(card->host, card);
+-		if (err)
+-			goto cmd_rel_host;
+-	}
+-
+-	if (is_rpmb) {
+-		err = mmc_set_blockcount(card, data.blocks,
+-			idata->ic.reliable_write_flag);
+-		if (err)
+-			goto cmd_rel_host;
+-	}
++	err = mmc_set_blockcount(card, data.blocks,
++		idata->ic.reliable_write_flag);
++	if (err)
++		goto cmd_rel_host;
+ 
+ 	mmc_wait_for_req(card->host, &mrq);
+ 
+@@ -575,25 +538,15 @@ int rpmb_access(struct block_device *bdev, struct mmc_blk_ioc_data *idata)
+ 		usleep_range(idata->ic.postsleep_min_us,
+ 				idata->ic.postsleep_max_us);
+ 
+-	if (is_rpmb) {
+-		/*
+-		 * Ensure RPMB command has completed by polling CMD13
+-		 * "Send Status".
+-		 */
+-		err = ioctl_rpmb_card_status_poll(card, &status, 5);
+-		if (err)
+-			pr_err("%s: Card Status=0x%08X, error %d\n",
++	/*
++	 * Ensure RPMB command has completed by polling CMD13 "Send Status".
++	 */
++	err = ioctl_rpmb_card_status_poll(card, &status, 5);
++	if (err)
++		pr_err("%s: Card Status=0x%08X, error %d\n",
+ 					__func__, status, err);
+-	}
+ 
+ cmd_rel_host:
+-	mmc_release_host(card->host);
+-
+-cmd_done:
+-	mmc_blk_put(md);
+-cmd_err:
+-	up(&mq->thread_sem);
+-	mmc_blk_put(data_md);
+ 	return err;
+ }
+ EXPORT_SYMBOL(rpmb_access);
+-- 
+1.8.1.2
+
